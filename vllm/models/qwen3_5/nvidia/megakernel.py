@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
@@ -486,6 +487,11 @@ class Qwen38MegakernelRunner:
         ctx = get_forward_context()
         attn_md = ctx.attn_metadata
         if not isinstance(attn_md, dict):
+            return None
+        # PIECEWISE steps (mixed batches; and their capture passes) stay on the
+        # compiled model so its piecewise graphs get captured and replayed; the
+        # megakernel serves FULL-graph uniform decode and eager steps.
+        if ctx.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             return None
         M = int(positions.shape[-1])
         if M > MAX_ROWS:
