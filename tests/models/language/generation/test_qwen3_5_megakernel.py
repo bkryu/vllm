@@ -20,7 +20,7 @@ from vllm.models.qwen3_5.nvidia.megakernel import (
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="swizzle_blockscale moves to CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("n,k16", [(34816, 320), (5120, 1088), (200, 7)])
 def test_unswizzle_blockscale_roundtrip(n, k16):
     scale = (torch.rand(n, k16, device="cuda") * 4).to(torch.float8_e4m3fn)
