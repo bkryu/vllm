@@ -249,10 +249,7 @@ class Qwen38MegakernelRunner:
             logger.info(msg, *args)
 
     def _prepare(self) -> None:
-        from flashinfer.experimental.qwen38_megakernel import (
-            build_rope_cache,
-            interleave_gate_up,
-        )
+        from flashinfer.experimental.qwen38_megakernel import build_rope_cache
 
         model = self.model
         dev = model.embed_tokens.weight.device
@@ -268,7 +265,10 @@ class Qwen38MegakernelRunner:
             nxt = model.layers[j + 1].input_layernorm if j + 1 < n else model.norm
             m = layer.mlp
             w_gu, s_gu, a_gu = _nvfp4_parts(m.gate_up_proj, f"layer {j} gate_up_proj")
-            w_il, s_il = interleave_gate_up(w_gu, s_gu, self.I)
+            w_il, s_il = (
+                w_gu,
+                s_gu,
+            )  # stored [gate | up] rows: two TMA boxes per stage (gate_up_split)
             w_dn, s_dn, a_dn = _nvfp4_parts(m.down_proj, f"layer {j} down_proj")
             ly: dict[str, Any] = dict(
                 w_gu_il=w_il,
@@ -320,22 +320,12 @@ class Qwen38MegakernelRunner:
                         f"layer {j} qkv_proj rows {w.shape[0]} != 2*q + k + v "
                         "with the output gate"
                     )
-                # vLLM packs [q_h | gate_h] per head; the kernel wants q | gate | k | v
-                # (a row permutation)
-                d = torch.arange(self.d, device=dev)
-                heads = torch.arange(self.hq, device=dev)[:, None] * (2 * self.d)
-                perm = torch.cat(
-                    [
-                        (heads + d).reshape(-1),
-                        (heads + self.d + d).reshape(-1),
-                        torch.arange(2 * qd, 2 * qd + 2 * kvd, device=dev),
-                    ]
-                )
+                # vLLM packs [q_h | gate_h] per head: the kernel reads that order
                 s_in = _fp8_scale(a.qkv_proj, f"layer {j} qkv_proj")
                 kvp = self._attn_pages(a, j)
                 ly.update(
                     kind=1,
-                    w_in=w[perm].contiguous(),
+                    w_in=w,
                     alpha_in=torch.tensor([s_in] * 4, dtype=torch.float32, device=dev),
                     w_out=_fp8_nk(a.o_proj, f"layer {j} o_proj"),
                     alpha_out=torch.tensor(
@@ -364,7 +354,7 @@ class Qwen38MegakernelRunner:
             t.numel() * t.element_size()
             for ly in layers
             for k, t in ly.items()
-            if k in ("w_gu_il", "s_gu_il", "s_dn") or (k == "w_in" and ly["kind"] == 1)
+            if k in ("s_gu_il", "s_dn")
         )
         logger.info(
             "Qwen3.8 megakernel: prepared %d layers (%.2f GB of permuted / "
@@ -456,6 +446,8 @@ class Qwen38MegakernelRunner:
                 conv_sd=True,
                 kv_packed=True,
                 slot_table=True,
+                gate_up_split=True,
+                q_gate_il=True,
             )
         return spec
 
