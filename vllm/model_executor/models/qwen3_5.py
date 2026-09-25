@@ -378,11 +378,34 @@ class Qwen3_5ForCausalLMBase(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        if intermediate_tensors is None:
+            mk = self.megakernel_runner()
+            if mk is not None:
+                hidden_states = mk.maybe_forward(input_ids, positions, inputs_embeds)
+                if hidden_states is not None:
+                    return hidden_states
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
 
         return hidden_states
+
+    def megakernel_runner(self):
+        """The Qwen3.8 decoder megakernel runner (``--gdn-decode-backend
+        megakernel``), created on first use; None when the backend is off."""
+        runner = getattr(self, "_megakernel_runner", None)
+        if runner is None and not getattr(self, "_megakernel_checked", False):
+            from vllm.models.qwen3_5.nvidia.megakernel import (
+                Qwen38MegakernelRunner,
+                megakernel_requested,
+            )
+
+            self._megakernel_checked = True
+            if megakernel_requested(self.vllm_config):
+                runner = self._megakernel_runner = Qwen38MegakernelRunner(
+                    self.model, self.vllm_config
+                )
+        return runner
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -587,6 +610,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         """
         if intermediate_tensors is not None:
             inputs_embeds = None
+        else:
+            mk = self.language_model.megakernel_runner()
+            if mk is not None:
+                hidden_states = mk.maybe_forward(input_ids, positions, inputs_embeds)
+                if hidden_states is not None:
+                    return hidden_states
 
         hidden_states = self.language_model.model(
             input_ids=input_ids,

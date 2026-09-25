@@ -679,6 +679,14 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
+    # The batch-wide block table / sequence lengths of the CommonAttentionMetadata
+    # this metadata was built from. Not consumed by the FlashInfer kernels: model
+    # -level fused decode paths (e.g. the Qwen3.8 megakernel) read the paged KV
+    # geometry from here instead of the kernel-specific `decode` payload.
+    block_table_tensor: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    max_seq_len: int = 0
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
@@ -1398,6 +1406,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             prefill=None,
             decode=None,
             cascade_wrapper=None,
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            seq_lens=common_attn_metadata.seq_lens,
+            max_seq_len=common_attn_metadata.max_seq_len,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed

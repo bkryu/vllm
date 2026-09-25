@@ -842,6 +842,43 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 cache_config.mamba_ssm_cache_dtype,
             )
 
+        # --gdn-decode-backend megakernel: the whole-decoder FlashInfer launch
+        # needs a fixed paged-KV geometry; settle it here, before the platform
+        # aligns the hybrid block size and the attention backend is selected.
+        from vllm.models.qwen3_5.nvidia.megakernel import (
+            megakernel_requested,
+            megakernel_unsupported_reason,
+            text_only_multimodal_reason,
+        )
+
+        if megakernel_requested(vllm_config):
+            reason = megakernel_unsupported_reason(
+                vllm_config
+            ) or text_only_multimodal_reason(vllm_config)
+            if reason is not None:
+                raise ValueError(f"--gdn-decode-backend megakernel: {reason}")
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            attn = vllm_config.attention_config
+            if attn.backend is None:
+                attn.backend = AttentionBackendEnum.FLASHINFER
+            elif attn.backend != AttentionBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "--gdn-decode-backend megakernel needs the FLASHINFER "
+                    f"attention backend (got {attn.backend.name})"
+                )
+            if cache_config.user_specified_block_size and cache_config.block_size != 32:
+                raise ValueError(
+                    "--gdn-decode-backend megakernel needs --block-size 32 "
+                    f"(got {cache_config.block_size})"
+                )
+            cache_config.block_size = 32
+            cache_config.user_specified_block_size = True
+            logger.info(
+                "Qwen3.5 megakernel decode backend: FLASHINFER attention, block "
+                "size 32; uniform decode steps run as one FlashInfer launch."
+            )
+
 
 class Qwen3_5ForCausalLMConfig(Qwen3_5ForConditionalGenerationConfig):
     @staticmethod

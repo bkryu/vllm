@@ -817,6 +817,7 @@ class EngineArgs:
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
     ) = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
+    gdn_decode_backend: Literal["auto", "megakernel", "cuda", "triton"] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1838,6 +1839,17 @@ class EngineArgs:
             default=None,
             help="Select KDA decode backend.",
         )
+        parser.add_argument(
+            "--gdn-decode-backend",
+            dest="gdn_decode_backend",
+            choices=["auto", "megakernel", "cuda", "triton"],
+            default=None,
+            help="Select the GDN (gated DeltaNet) decode backend. 'cuda' / "
+            "'triton' pick the per-layer decode kernel (VLLM_GDN_DECODE_KERNEL); "
+            "'megakernel' runs uniform decode steps of Qwen3.5-family dense "
+            "decoders as ONE FlashInfer launch (SM120, TP=1, experimental; forces "
+            "block size 32 and the FLASHINFER attention backend).",
+        )
         return parser
 
     @classmethod
@@ -2701,6 +2713,10 @@ class EngineArgs:
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
         if self.kda_decode_backend is not None:
             self.additional_config["kda_decode_backend"] = self.kda_decode_backend
+        if self.gdn_decode_backend is not None:
+            self.additional_config["gdn_decode_backend"] = self.gdn_decode_backend
+            if self.gdn_decode_backend in ("cuda", "triton"):
+                os.environ.setdefault("VLLM_GDN_DECODE_KERNEL", self.gdn_decode_backend)
 
         config = VllmConfig(
             model_config=model_config,
