@@ -16,6 +16,10 @@ from vllm.model_executor.determinism.batch_invariant_configs import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import (
+    flashinfer_nvfp4_4over6_requested,
+    has_flashinfer_batch_invariant_quantizers,
+)
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.nccl import pin_nccl_env
 from vllm.utils.platform_utils import num_compute_units
@@ -1359,6 +1363,36 @@ _fp32_block_size_n = 128
 _fp32_num_stages = 3
 _BLOCK_SIZES_RESOLVED = False
 _NUM_SMS: int = 0
+
+
+# Whether the NVFP4 / MXFP4 linear kernels quantize their activations with
+# FlashInfer's batch-invariant quantizers (the mode, on a part and FlashInfer
+# release that has them): resolved once, so traced code reads a flag.
+_FLASHINFER_QUANTIZERS: bool | None = None
+
+
+def flashinfer_quantizers_enabled() -> bool:
+    global _FLASHINFER_QUANTIZERS
+    if _FLASHINFER_QUANTIZERS is None:
+        _FLASHINFER_QUANTIZERS = bool(
+            envs.VLLM_BATCH_INVARIANT and has_flashinfer_batch_invariant_quantizers()
+        )
+    return _FLASHINFER_QUANTIZERS
+
+
+_FLASHINFER_NVFP4_QUANTIZER: bool | None = None
+
+
+def flashinfer_nvfp4_quantizer_enabled() -> bool:
+    """flashinfer_quantizers_enabled() for the NVFP4 linear layers: FlashInfer's
+    batch-invariant quantizer covers the plain NVFP4 recipe only, so its 4-over-6
+    environment keeps vLLM's quantizer. Resolved once, like the mode flag."""
+    global _FLASHINFER_NVFP4_QUANTIZER
+    if _FLASHINFER_NVFP4_QUANTIZER is None:
+        _FLASHINFER_NVFP4_QUANTIZER = (
+            flashinfer_quantizers_enabled() and not flashinfer_nvfp4_4over6_requested()
+        )
+    return _FLASHINFER_NVFP4_QUANTIZER
 
 
 def _resolve_block_sizes():

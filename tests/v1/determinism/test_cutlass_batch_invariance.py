@@ -14,12 +14,23 @@ import pytest
 import torch
 
 import vllm.envs as envs
+import vllm.model_executor.determinism.batch_invariant as bi
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config, make_test_quant_config
-from tests.kernels.quantization.nvfp4_utils import get_nvfp4_global_scale
+from tests.kernels.quantization.nvfp4_utils import (
+    convert_swizzled_to_linear,
+    get_nvfp4_global_scale,
+)
 from tests.utils import TestFP8Layer, requires_fp8
 from vllm import _custom_ops as ops
-from vllm.model_executor.kernels.linear import fp8_scaled_mm_is_batch_invariant
+from vllm.model_executor.kernels.linear import (
+    CutlassNvFp4LinearKernel,
+    fp8_scaled_mm_is_batch_invariant,
+)
+from vllm.model_executor.kernels.linear.nvfp4.base import (
+    NvFp4LinearKernel,
+    NvFp4LinearLayerConfig,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     TritonFP8ScaledMMLinearKernel,
@@ -38,8 +49,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
     kFp8StaticTokenSym,
+    kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import (
+    flashinfer_batch_invariant_quantizer_fits,
+    has_flashinfer_batch_invariant_quantizers,
+)
 from vllm.utils.torch_utils import set_random_seed
 
 pytest.importorskip("torch.cuda")
@@ -491,3 +507,108 @@ def test_cutlass_nvfp4_moe_batch_invariant(
                 "relative to full-batch execution."
             ),
         )
+
+
+_FLASHINFER_QUANTIZER_SKIP = pytest.mark.skipif(
+    not has_flashinfer_batch_invariant_quantizers(),
+    reason="FlashInfer's batch-invariant quantizers need FlashInfer >= 0.7.4 on "
+    "SM100 / SM103 / SM107",
+)
+
+
+def _nvfp4_cutlass_layer(n: int, k: int) -> tuple[torch.nn.Module, NvFp4LinearKernel]:
+    """A ModelOpt-style NVFP4 W4A4 layer with a random weight on the CUTLASS kernel."""
+    set_random_seed(2)
+    w = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    w_gs = get_nvfp4_global_scale(w)
+    w_fp4, w_sf = ops.scaled_fp4_quant(w, w_gs, is_sf_swizzled_layout=False)
+    x_gs = torch.tensor(100.0, dtype=torch.float32, device="cuda")
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(w_fp4, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(w_sf, requires_grad=False)
+    layer.input_global_scale_inv = torch.nn.Parameter(x_gs, requires_grad=False)
+    layer.alpha = torch.nn.Parameter(1.0 / (x_gs * w_gs), requires_grad=False)
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    kernel = CutlassNvFp4LinearKernel(NvFp4LinearLayerConfig(act_dtype=torch.bfloat16))
+    kernel.process_weights_after_loading(layer)
+    return layer, kernel
+
+
+def _reset_flashinfer_quantizer_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bi, "_FLASHINFER_QUANTIZERS", None)
+    monkeypatch.setattr(bi, "_FLASHINFER_NVFP4_QUANTIZER", None)
+
+
+@_NVFP4_REQUIRES_SM100
+@_FLASHINFER_QUANTIZER_SKIP
+@torch.inference_mode()
+def test_nvfp4_linear_flashinfer_quantizer_batch_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under the mode the CUTLASS NVFP4 layer quantizes its activations with
+    FlashInfer's batch-invariant quantizer: row 0 alone equals row 0 inside a
+    257-row batch (codes and scales, bitwise) and a direct FlashInfer call, and
+    the GEMM rows at M = 1 equal the rows inside the batch."""
+    from flashinfer import SfLayout, nvfp4_quantize
+
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6", raising=False)
+    _reset_flashinfer_quantizer_flags(monkeypatch)
+    assert bi.flashinfer_nvfp4_quantizer_enabled()
+    k = 2048
+    layer, kernel = _nvfp4_cutlass_layer(256, k)
+    assert kernel.input_quant_key() is None  # the fused act + quant producers stay off
+    x = torch.randn((257, k), dtype=torch.bfloat16, device="cuda")
+    full = kernel.prepare_input(layer, x)
+    row = kernel.prepare_input(layer, x[:1])
+    assert torch.equal(row.data[0], full.data[0])
+    assert torch.equal(
+        convert_swizzled_to_linear(row.scale.view(torch.uint8), 1, k, 16)[0],
+        convert_swizzled_to_linear(full.scale.view(torch.uint8), 257, k, 16)[0],
+    )
+    data, sf = nvfp4_quantize(
+        x,
+        layer.input_global_scale_inv,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="auto",
+        batch_invariant=True,
+    )
+    assert torch.equal(full.data, data)
+    assert torch.equal(full.scale.view(torch.uint8), sf.view(torch.uint8))
+    out = kernel.apply_weights(layer, x)
+    assert torch.equal(kernel.apply_weights(layer, x[:1])[0], out[0])
+
+
+@_NVFP4_REQUIRES_SM100
+@_FLASHINFER_QUANTIZER_SKIP
+@torch.inference_mode()
+def test_nvfp4_linear_quantizer_fallbacks_keep_vllm_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without FlashInfer's batch-invariant quantizer, with the 4-over-6 recipe,
+    or for rows outside its contract, prepare_input calls vLLM's kernel exactly
+    as before (the same bytes) and keeps the pre-quantized input key."""
+    k = 2048
+    layer, kernel = _nvfp4_cutlass_layer(32, k)
+    x = torch.randn((4, k), dtype=torch.bfloat16, device="cuda")
+    data, scale = ops.scaled_fp4_quant(
+        x, layer.input_global_scale_inv, is_sf_swizzled_layout=True, padded_n=k
+    )
+
+    def check_native() -> None:
+        qa = kernel.prepare_input(layer, x)
+        assert torch.equal(qa.data, data) and torch.equal(qa.scale, scale)
+        assert kernel.input_quant_key() == kNvfp4Dynamic
+
+    monkeypatch.setattr(bi, "has_flashinfer_batch_invariant_quantizers", lambda: False)
+    _reset_flashinfer_quantizer_flags(monkeypatch)
+    check_native()
+    monkeypatch.undo()
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    _reset_flashinfer_quantizer_flags(monkeypatch)
+    check_native()
+    # K not a multiple of the scale block, or a row over 128 KiB
+    assert not flashinfer_batch_invariant_quantizer_fits(k + 8, torch.bfloat16, 16)
+    assert not flashinfer_batch_invariant_quantizer_fits(65568, torch.bfloat16, 16)
+    assert flashinfer_batch_invariant_quantizer_fits(k, torch.bfloat16, 16)

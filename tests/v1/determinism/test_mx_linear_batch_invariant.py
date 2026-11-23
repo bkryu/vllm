@@ -10,6 +10,7 @@ from utils import requires_mx, skip_if_not_cuda
 from vllm.model_executor.kernels.linear import HummingMxfp8LinearKernel
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+from vllm.utils.flashinfer import has_flashinfer_batch_invariant_quantizers
 from vllm.utils.import_utils import has_humming
 from vllm.utils.torch_utils import set_random_seed
 
@@ -209,3 +210,62 @@ def test_humming_mxfp8_linear_is_batch_invariant(
         f"Humming MXFP8 linear depends on the row count (N={n}, K={k}):\n  "
         + "\n  ".join(failures)
     )
+
+
+@skip_if_not_cuda
+@pytest.mark.skipif(
+    not has_flashinfer_batch_invariant_quantizers(),
+    reason="FlashInfer's batch-invariant quantizers need FlashInfer >= 0.7.4 on "
+    "SM100 / SM103 / SM107",
+)
+@torch.inference_mode()
+def test_mxfp4_linear_flashinfer_quantizer_batch_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Under the mode the FlashInfer MXFP4 W4A4 kernel quantizes its activations
+    with FlashInfer's batch-invariant quantizer: row 0 alone equals row 0 inside
+    a 257-row batch (codes and scales, bitwise) and a direct FlashInfer call, and
+    the GEMM rows at M = 1 equal the rows inside the batch."""
+    from flashinfer import mxfp4_quantize
+
+    import vllm.model_executor.determinism.batch_invariant as bi
+    from tests.kernels.quantization.nvfp4_utils import convert_swizzled_to_linear
+    from vllm.model_executor.kernels.linear import FlashInferMxFp4LinearKernel
+    from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp4Dynamic,
+    )
+    from vllm.utils.flashinfer import flashinfer_mxfp4_quantize
+
+    supported, reason = FlashInferMxFp4LinearKernel.is_supported()
+    if not supported:
+        pytest.skip(reason)
+    monkeypatch.setattr(bi, "_FLASHINFER_QUANTIZERS", None)
+    assert bi.flashinfer_quantizers_enabled()
+    set_random_seed(SEED)
+    n, k = 256, 2048
+    weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_scale = torch.randint(
+        127 - SCALE_SPREAD, 128 + SCALE_SPREAD, (n, k // 32), dtype=torch.uint8
+    ).cuda()
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    layer.output_size_per_partition = n
+    kernel = FlashInferMxFp4LinearKernel(
+        MxFp4LinearLayerConfig(activation_quant_key=kMxfp4Dynamic)
+    )
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(257, k, device="cuda", dtype=torch.bfloat16)
+    # the quantizer call of apply_weights, at M = 257 and M = 1
+    full = flashinfer_mxfp4_quantize(x, backend="cute-dsl", batch_invariant=True)
+    row = flashinfer_mxfp4_quantize(x[:1], backend="cute-dsl", batch_invariant=True)
+    assert torch.equal(row[0][0], full[0][0])
+    assert torch.equal(
+        convert_swizzled_to_linear(row[1], 1, k, 32)[0],
+        convert_swizzled_to_linear(full[1], 257, k, 32)[0],
+    )
+    direct = mxfp4_quantize(x, backend="auto", batch_invariant=True)
+    assert torch.equal(full[0], direct[0]) and torch.equal(full[1], direct[1])
+    out = kernel.apply_weights(layer, x)
+    assert torch.equal(kernel.apply_weights(layer, x[:1])[0], out[0])

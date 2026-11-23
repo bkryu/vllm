@@ -158,6 +158,13 @@ When batch invariance is enabled, vLLM:
 5. On CUDA devices with tuned matmul table entries for the model's bf16 unquantized forward linear layers (Ada, Hopper, Blackwell),
    runs without `torch.compile` using breakable CUDA graphs so tile configs follow the runtime batch size; set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` to opt out.
 6. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
+7. On SM100, SM103 and SM107 with FlashInfer >= 0.7.4, quantizes the activations of the NVFP4 (CUTLASS) and MXFP4 (FlashInfer)
+   linear layers with FlashInfer's batch-invariant quantizers (`nvfp4_quantize` / `mxfp4_quantize` with `batch_invariant=True`):
+   a row's codes and scales do not depend on the rows around it, and the quantizers compile for the CUDA graph sizes before
+   capture. The codes can differ from vLLM's own quantizer on a small fraction of elements (a different rounding path). The fused
+   activation + NVFP4 quantization producers are off in this mode so every activation passes through the quantizer. The
+   GEMMs are unchanged. 4-over-6 NVFP4 quantization (`FLASHINFER_NVFP4_4OVER6`), rows outside FlashInfer's quantizer contract,
+   and platforms without FlashInfer >= 0.7.4 keep vLLM's own quantizers.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

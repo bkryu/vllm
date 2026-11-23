@@ -29,7 +29,7 @@ class TorchNvFp4LinearKernel(NvFp4LinearKernel):
     including NVGEMM on supported Blackwell systems.
     """
 
-    def input_quant_key(self) -> QuantKey:
+    def native_input_quant_key(self) -> QuantKey:
         return kNvfp4Dynamic
 
     @classmethod

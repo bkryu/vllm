@@ -12,7 +12,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -166,6 +166,67 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     ll_bf16_gemm_kernel.warmup(
         shapes=shapes,
         m_values=_LL_BF16_WARMUP_M_RANGE,
+    )
+
+
+def _warmup_flashinfer_batch_invariant_quantizers(
+    models: list[torch.nn.Module], m_values: list[int]
+) -> None:
+    """Under VLLM_BATCH_INVARIANT=1 with FlashInfer's batch-invariant
+    quantizers: run the NVFP4 and MXFP4 linear layers' activation quantizers
+    at the CUDA graph sizes before capture (the quantizer compiles one kernel
+    per (M, K, dtype, layout) configuration on first use)."""
+    if not envs.VLLM_BATCH_INVARIANT or not m_values:
+        return
+    from vllm.model_executor.determinism import batch_invariant as bi
+
+    if not bi.flashinfer_quantizers_enabled():
+        return
+    from vllm.model_executor.kernels.linear import (
+        CutlassNvFp4LinearKernel,
+        FlashInferMxFp4LinearKernel,
+    )
+    from vllm.utils.flashinfer import flashinfer_mxfp4_quantize
+
+    nvfp4: dict[tuple[int, torch.dtype], tuple[Any, torch.nn.Module]] = {}
+    mxfp4: dict[tuple[int, torch.dtype], torch.nn.Module] = {}
+    for model in models:
+        for module in model.modules():
+            dtype = getattr(module, "params_dtype", None)
+            k = getattr(module, "input_size_per_partition", None)
+            if not isinstance(dtype, torch.dtype) or k is None:
+                continue
+            for holder_name in ("quant_method", "scheme"):
+                kernel = getattr(getattr(module, holder_name, None), "kernel", None)
+                if isinstance(kernel, CutlassNvFp4LinearKernel):
+                    if bi.flashinfer_nvfp4_quantizer_enabled():
+                        nvfp4.setdefault((k, dtype), (kernel, module))
+                elif isinstance(kernel, FlashInferMxFp4LinearKernel):
+                    mxfp4.setdefault((k, dtype), module)
+    if not nvfp4 and not mxfp4:
+        return
+
+    start = time.perf_counter()
+    max_m = max(m_values)
+    with torch.inference_mode():
+        for (k, dtype), (kernel, layer) in nvfp4.items():
+            x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
+            for m in m_values:
+                kernel.prepare_input(layer, x[:m])
+        for (k, dtype), layer in mxfp4.items():
+            x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
+            for m in m_values:
+                flashinfer_mxfp4_quantize(
+                    x[:m], backend="cute-dsl", batch_invariant=True
+                )
+    torch.accelerator.synchronize()
+    logger.info(
+        "FlashInfer batch-invariant quantizers: warmed %d NVFP4 and %d MXFP4 "
+        "activation shapes at %d batch sizes in %.1fs.",
+        len(nvfp4),
+        len(mxfp4),
+        len(m_values),
+        time.perf_counter() - start,
     )
 
 
@@ -344,6 +405,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         # https://github.com/vllm-project/vllm/pull/47451
         _warmup_skinny_gemm(worker.get_model())
         cutedsl_warmup()
+
+    _warmup_flashinfer_batch_invariant_quantizers(
+        [m for m in (worker.get_model(), worker.get_draft_model()) if m is not None],
+        sorted(
+            set(cudagraph_capture_sizes)
+            | {worker.scheduler_config.max_num_batched_tokens}
+        ),
+    )
 
     if process_local_only:
         return
