@@ -58,6 +58,9 @@ from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
 
 if TYPE_CHECKING:
     from vllm.config import MultiModalConfig
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        _FlashInferMmMxfp8LinearKernel,
+    )
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
@@ -169,13 +172,33 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
 
+def _flashinfer_mxfp8_kernel(
+    module: torch.nn.Module,
+) -> "_FlashInferMmMxfp8LinearKernel | None":
+    """The FlashInfer `mm_mxfp8` kernel of a linear layer's quant method (held
+    by the method or by its compressed-tensors / Quark scheme), or None."""
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        _FlashInferMmMxfp8LinearKernel,
+    )
+
+    quant_method = getattr(module, "quant_method", None)
+    for holder in (quant_method, getattr(quant_method, "scheme", None)):
+        for attr in ("kernel", "ocp_mx_linear"):
+            kernel = getattr(holder, attr, None)
+            if isinstance(kernel, _FlashInferMmMxfp8LinearKernel):
+                return kernel
+    return None
+
+
 def _warmup_flashinfer_batch_invariant_quantizers(
     models: list[torch.nn.Module], m_values: list[int]
 ) -> None:
     """Under VLLM_BATCH_INVARIANT=1 with FlashInfer's batch-invariant
     quantizers: run the NVFP4 and MXFP4 linear layers' activation quantizers
-    at the CUDA graph sizes before capture (the quantizer compiles one kernel
-    per (M, K, dtype, layout) configuration on first use)."""
+    and the MXFP8 linear layers (quantizer and GEMM) at the CUDA graph sizes
+    before capture (the quantizer compiles one kernel per (M, K, dtype, layout)
+    configuration on first use; the MXFP8 GEMM one per configuration, chosen
+    from the batch)."""
     if not envs.VLLM_BATCH_INVARIANT or not m_values:
         return
     from vllm.model_executor.determinism import batch_invariant as bi
@@ -190,6 +213,10 @@ def _warmup_flashinfer_batch_invariant_quantizers(
 
     nvfp4: dict[tuple[int, torch.dtype], tuple[Any, torch.nn.Module]] = {}
     mxfp4: dict[tuple[int, torch.dtype], torch.nn.Module] = {}
+    mxfp8: dict[
+        tuple[int, int, torch.dtype],
+        tuple[_FlashInferMmMxfp8LinearKernel, torch.nn.Module],
+    ] = {}
     for model in models:
         for module in model.modules():
             dtype = getattr(module, "params_dtype", None)
@@ -203,7 +230,18 @@ def _warmup_flashinfer_batch_invariant_quantizers(
                         nvfp4.setdefault((k, dtype), (kernel, module))
                 elif isinstance(kernel, FlashInferMxFp4LinearKernel):
                     mxfp4.setdefault((k, dtype), module)
-    if not nvfp4 and not mxfp4:
+            mxfp8_kernel = _flashinfer_mxfp8_kernel(module)
+            weight = getattr(module, "weight", None)
+            if (
+                mxfp8_kernel is not None
+                and isinstance(weight, torch.Tensor)
+                and weight.dim() == 2
+            ):
+                _, k_w = mxfp8_kernel.config.weight_shape
+                # the GEMM runs the padded N of the stored weight ([K, N] or [N, K])
+                n = weight.shape[1] if weight.shape[0] == k_w else weight.shape[0]
+                mxfp8.setdefault((n, k_w, dtype), (mxfp8_kernel, module))
+    if not nvfp4 and not mxfp4 and not mxfp8:
         return
 
     start = time.perf_counter()
@@ -219,12 +257,18 @@ def _warmup_flashinfer_batch_invariant_quantizers(
                 flashinfer_mxfp4_quantize(
                     x[:m], backend="cute-dsl", batch_invariant=True
                 )
+        for (_, k, dtype), (mxfp8_kernel, layer) in mxfp8.items():
+            x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
+            for m in m_values:
+                mxfp8_kernel.apply_weights(layer, x[:m])
     torch.accelerator.synchronize()
     logger.info(
         "FlashInfer batch-invariant quantizers: warmed %d NVFP4 and %d MXFP4 "
-        "activation shapes at %d batch sizes in %.1fs.",
+        "activation shapes and %d MXFP8 layer shapes (quantizer + GEMM) at %d "
+        "batch sizes in %.1fs.",
         len(nvfp4),
         len(mxfp4),
+        len(mxfp8),
         len(m_values),
         time.perf_counter() - start,
     )

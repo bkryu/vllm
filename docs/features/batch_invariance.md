@@ -165,6 +165,12 @@ When batch invariance is enabled, vLLM:
    activation + NVFP4 quantization producers are off in this mode so every activation passes through the quantizer. The
    GEMMs are unchanged. 4-over-6 NVFP4 quantization (`FLASHINFER_NVFP4_4OVER6`), rows outside FlashInfer's quantizer contract,
    and platforms without FlashInfer >= 0.7.4 keep vLLM's own quantizers.
+8. On the same parts and FlashInfer release, runs the dense MXFP8 linear layers on FlashInfer's batch-invariant
+   MXFP8 quantizer and GEMM (`mxfp8_quantize(..., batch_invariant=True)`, `mm_mxfp8(..., batch_invariant=True)`): the
+   activations are quantized and a row's output bits do not depend on the batch, where before the mode dequantized the
+   weights to bf16 at load and ran an unquantized bf16 linear. Online MXFP8 weight quantization takes the same quantizer
+   under the mode; MoE experts are unchanged. The warm-up compiles the kernels for the CUDA graph sizes. Where FlashInfer's
+   batch-invariant kernels are unavailable, or a layer's shape is outside their rules, the previous Emulation path is kept.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

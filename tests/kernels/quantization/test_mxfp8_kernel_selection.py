@@ -156,26 +156,38 @@ def test_init_mxfp8_linear_kernel(capability, weight_shape, expected_kernel_cls)
 
 
 @pytest.mark.parametrize(
-    ("capability", "linear_backend", "expected_kernel_cls"),
+    ("capability", "linear_backend", "flashinfer_classes", "expected_kernel_cls"),
     [
-        (80, "auto", EmulationMxfp8LinearKernel),
-        (90, "auto", HummingMxfp8LinearKernel),
-        (100, "auto", EmulationMxfp8LinearKernel),
-        (100, "flashinfer_cutedsl", EmulationMxfp8LinearKernel),
+        (80, "auto", False, EmulationMxfp8LinearKernel),
+        (90, "auto", False, HummingMxfp8LinearKernel),
+        (100, "auto", False, EmulationMxfp8LinearKernel),
+        (100, "flashinfer_cutedsl", False, EmulationMxfp8LinearKernel),
+        (100, "auto", True, FlashInferCutedslMxfp8LinearKernel),
+        (100, "flashinfer_cutedsl", True, FlashInferCutedslMxfp8LinearKernel),
+        (100, "flashinfer_cutlass", True, FlashInferCutlassMxfp8LinearKernel),
+        (103, "auto", True, FlashInferCutedslMxfp8LinearKernel),
     ],
 )
 def test_batch_invariance_selects_batch_invariant_kernel(
-    monkeypatch, capability, linear_backend, expected_kernel_cls
+    monkeypatch, capability, linear_backend, flashinfer_classes, expected_kernel_cls
 ):
-    """Marlin (SM80 default) and FlashInfer (SM100 default) tile by row count,
-    so VLLM_BATCH_INVARIANT must not select them, even when requested. SM90
-    must keep Humming, its default, instead of falling to Emulation."""
+    """Marlin (SM80 default) and FlashInfer's default backends (SM100) tile by
+    row count, so VLLM_BATCH_INVARIANT must not select them, even when
+    requested, unless FlashInfer's batch-invariant MXFP8 classes are available
+    (FlashInfer >= 0.7.4 on SM100 / SM103 / SM107): then the FlashInfer kernels
+    run those classes and come first. SM90 must keep Humming, its default,
+    instead of falling to Emulation."""
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     with (
         _patch_cuda_platform(capability),
         patch(
             "vllm.model_executor.kernels.linear._get_linear_backend",
             return_value=linear_backend,
+        ),
+        patch(
+            "vllm.model_executor.kernels.linear.mxfp8.flashinfer."
+            "has_flashinfer_batch_invariant_quantizers",
+            return_value=flashinfer_classes,
         ),
         patch(
             "vllm.model_executor.layers.quantization.utils.humming.priority."
@@ -193,6 +205,30 @@ def test_batch_invariance_selects_batch_invariant_kernel(
         kernel = init_mxfp8_linear_kernel(weight_shape=_SUPPORTED_SHAPE)
 
     assert type(kernel) is expected_kernel_cls
+
+
+@pytest.mark.parametrize(
+    "weight_shape",
+    [(4096, 4112), (64, 4096), (4096, 64), (256, 65568)],
+    ids=["K%32", "N<128", "K<128", "rows>128KiB"],
+)
+def test_batch_invariance_falls_back_outside_flashinfer_shape_rules(
+    monkeypatch, weight_shape
+):
+    """Under the mode with FlashInfer's batch-invariant kernels available, a
+    layer they cannot take (K % 32 != 0, N or K below 128, activation rows over
+    128 KiB) keeps today's Emulation fallback."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    with (
+        _patch_cuda_platform(100),
+        patch(
+            "vllm.model_executor.kernels.linear.mxfp8.flashinfer."
+            "has_flashinfer_batch_invariant_quantizers",
+            return_value=True,
+        ),
+    ):
+        kernel = init_mxfp8_linear_kernel(weight_shape=weight_shape)
+    assert type(kernel) is EmulationMxfp8LinearKernel
 
 
 _AITER_FLYDSL_TUNED_SHAPE = (2560, 6144)

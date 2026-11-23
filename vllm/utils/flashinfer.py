@@ -173,9 +173,9 @@ def has_flashinfer_bf16_gemm() -> bool:
 
 @functools.cache
 def has_flashinfer_batch_invariant_quantizers() -> bool:
-    """Return whether FlashInfer's batch-invariant NVFP4 / MXFP4 quantizers
-    (`nvfp4_quantize(..., batch_invariant=True)`, FlashInfer >= 0.7.4) can run
-    on this device: CUDA on SM100, SM103 or SM107."""
+    """Return whether FlashInfer's batch-invariant NVFP4 / MXFP4 / MXFP8
+    quantizers and MXFP8 GEMM (`batch_invariant=True`, FlashInfer >= 0.7.4) can
+    run on this device: CUDA on SM100, SM103 or SM107."""
     if not current_platform.is_cuda() or not has_flashinfer():
         return False
     capability = current_platform.get_device_capability()
@@ -1361,7 +1361,21 @@ if has_flashinfer():
         out_dtype: torch.dtype,
         backend: str = "cutlass",
         use_8x4_sf_layout: bool = False,
+        batch_invariant: bool = False,
     ) -> torch.Tensor:
+        if batch_invariant:
+            # FlashInfer's batch-invariant GEMM accepts only backend="auto".
+            return _flashinfer_attr("mm_mxfp8")(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out=None,
+                out_dtype=out_dtype,
+                backend="auto",
+                use_8x4_sf_layout=use_8x4_sf_layout,
+                batch_invariant=True,
+            )
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
         return mm_mxfp8_(
@@ -1383,6 +1397,7 @@ if has_flashinfer():
         out_dtype: torch.dtype,
         backend: str = "cutlass",
         use_8x4_sf_layout: bool = False,
+        batch_invariant: bool = False,
     ) -> torch.Tensor:
         # A is [m, k], B is [k, n] -> output [m, n]
         return torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
