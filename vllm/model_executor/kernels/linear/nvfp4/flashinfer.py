@@ -119,7 +119,7 @@ class FlashInferCuteDslNvFp4W4A16LinearKernel(NvFp4LinearKernel):
 class FlashInferCuteDslNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 GEMM via FlashInfer's cutedsl backend."""
 
-    def input_quant_key(self) -> QuantKey | None:
+    def native_input_quant_key(self) -> QuantKey | None:
         return kNvfp4Dynamic
 
     @classmethod
@@ -175,7 +175,7 @@ class FlashInferCuteDslNvFp4LinearKernel(NvFp4LinearKernel):
 class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 GEMM via FlashInfer's CUTLASS wrapper."""
 
-    def input_quant_key(self) -> QuantKey | None:
+    def native_input_quant_key(self) -> QuantKey | None:
         """This kernel supports dynamic quantization of the input. By
         convention, pre-quantized blockscales must use the swizzled layout."""
         return kNvfp4Dynamic
@@ -313,7 +313,7 @@ class FlashInferTrtllmNvFp4LinearKernel(NvFp4LinearKernel):
 class FlashInferCudnnNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 GEMM via FlashInfer's cuDNN wrapper."""
 
-    def input_quant_key(self) -> QuantKey:
+    def native_input_quant_key(self) -> QuantKey:
         return kNvfp4Dynamic
 
     @classmethod
@@ -371,7 +371,7 @@ class FlashInferCudnnNvFp4LinearKernel(NvFp4LinearKernel):
 class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 GEMM via FlashInfer's b12x CuTe DSL warp-level MMA kernel (SM12x)."""
 
-    def input_quant_key(self) -> QuantKey:
+    def native_input_quant_key(self) -> QuantKey:
         return kNvfp4Dynamic
 
     @classmethod

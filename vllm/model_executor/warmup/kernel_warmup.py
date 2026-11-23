@@ -12,7 +12,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -190,28 +190,48 @@ def _flashinfer_mxfp8_kernel(
     return None
 
 
-def _warmup_flashinfer_batch_invariant_mxfp8(
+def _warmup_flashinfer_batch_invariant_quantizers(
     models: list[torch.nn.Module], m_values: list[int]
 ) -> None:
     """Under VLLM_BATCH_INVARIANT=1 with FlashInfer's batch-invariant kernels:
-    run the MXFP8 linear layers (quantizer and GEMM) at the CUDA graph sizes
-    before capture, since FlashInfer compiles one kernel per configuration on
-    first use and the configuration follows the batch."""
+    run the MXFP8 linear layers (quantizer and GEMM) and the NVFP4 / MXFP4
+    linear layers' activation quantizers at the CUDA graph sizes before
+    capture, since FlashInfer compiles one kernel per configuration on first
+    use and the configuration follows the batch."""
     if not envs.VLLM_BATCH_INVARIANT or not m_values:
         return
     from vllm.model_executor.determinism import batch_invariant as bi
 
     if not bi.flashinfer_quantizers_enabled():
         return
+    from vllm.model_executor.kernels.linear import (
+        CutlassNvFp4LinearKernel,
+        FlashInferMxFp4LinearKernel,
+    )
+    from vllm.utils.flashinfer import flashinfer_mxfp4_quantize
+
     layers: dict[
         tuple[int, int, torch.dtype],
         tuple[_FlashInferMmMxfp8LinearKernel, torch.nn.Module],
     ] = {}
+    nvfp4: dict[tuple[int, torch.dtype], tuple[Any, torch.nn.Module]] = {}
+    mxfp4: dict[tuple[int, torch.dtype], torch.nn.Module] = {}
     for model in models:
         for module in model.modules():
+            dtype = getattr(module, "params_dtype", None)
+            k_in = getattr(module, "input_size_per_partition", None)
+            if isinstance(dtype, torch.dtype) and k_in is not None:
+                for holder_name in ("quant_method", "scheme"):
+                    fp4_kernel = getattr(
+                        getattr(module, holder_name, None), "kernel", None
+                    )
+                    if isinstance(fp4_kernel, CutlassNvFp4LinearKernel):
+                        if bi.flashinfer_nvfp4_quantizer_enabled():
+                            nvfp4.setdefault((k_in, dtype), (fp4_kernel, module))
+                    elif isinstance(fp4_kernel, FlashInferMxFp4LinearKernel):
+                        mxfp4.setdefault((k_in, dtype), module)
             kernel = _flashinfer_mxfp8_kernel(module)
             weight = getattr(module, "weight", None)
-            dtype = getattr(module, "params_dtype", None)
             if kernel is None or not isinstance(weight, torch.Tensor):
                 continue
             if weight.dim() != 2 or not isinstance(dtype, torch.dtype):
@@ -220,7 +240,7 @@ def _warmup_flashinfer_batch_invariant_mxfp8(
             # the GEMM runs the padded N of the stored weight ([K, N] or [N, K])
             n = weight.shape[1] if weight.shape[0] == k else weight.shape[0]
             layers.setdefault((n, k, dtype), (kernel, module))
-    if not layers:
+    if not layers and not nvfp4 and not mxfp4:
         return
 
     start = time.perf_counter()
@@ -230,11 +250,23 @@ def _warmup_flashinfer_batch_invariant_mxfp8(
             x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
             for m in m_values:
                 kernel.apply_weights(layer, x[:m])
+        for (k, dtype), (fp4_kernel, layer) in nvfp4.items():
+            x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
+            for m in m_values:
+                fp4_kernel.prepare_input(layer, x[:m])
+        for (k, dtype), layer in mxfp4.items():
+            x = torch.zeros((max_m, k), dtype=dtype, device=layer.weight.device)
+            for m in m_values:
+                flashinfer_mxfp4_quantize(
+                    x[:m], backend="cute-dsl", batch_invariant=True
+                )
     torch.accelerator.synchronize()
     logger.info(
-        "FlashInfer batch-invariant MXFP8: warmed %d linear shapes at %d batch "
-        "sizes in %.1fs.",
+        "FlashInfer batch-invariant kernels: warmed %d MXFP8, %d NVFP4 and %d "
+        "MXFP4 linear shapes at %d batch sizes in %.1fs.",
         len(layers),
+        len(nvfp4),
+        len(mxfp4),
         len(m_values),
         time.perf_counter() - start,
     )
@@ -416,7 +448,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         _warmup_skinny_gemm(worker.get_model())
         cutedsl_warmup()
 
-    _warmup_flashinfer_batch_invariant_mxfp8(
+    _warmup_flashinfer_batch_invariant_quantizers(
         [m for m in (worker.get_model(), worker.get_draft_model()) if m is not None],
         sorted(
             set(cudagraph_capture_sizes)

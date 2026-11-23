@@ -3,6 +3,9 @@
 
 import torch
 
+from vllm.model_executor.determinism.batch_invariant import (
+    flashinfer_quantizers_enabled,
+)
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
     swizzle_mxfp4_scales,
 )
@@ -11,7 +14,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_cutedsl
+from vllm.utils.flashinfer import (
+    flashinfer_batch_invariant_quantizer_fits,
+    has_flashinfer_cutedsl,
+)
 
 from .base import MxFp4LinearKernel, MxFp4LinearLayerConfig
 
@@ -67,7 +73,12 @@ class FlashInferMxFp4LinearKernel(MxFp4LinearKernel):
         x_2d = x.reshape(-1, x.shape[-1])
 
         x_fp4, x_scale = flashinfer_mxfp4_quantize(
-            x_2d.contiguous(), backend="cute-dsl"
+            x_2d.contiguous(),
+            backend="cute-dsl",
+            batch_invariant=flashinfer_quantizers_enabled()
+            and flashinfer_batch_invariant_quantizer_fits(
+                x_2d.shape[-1], x_2d.dtype, _MXFP4_GROUP_SIZE
+            ),
         )
         out = flashinfer_scaled_fp4_mm(
             x_fp4,

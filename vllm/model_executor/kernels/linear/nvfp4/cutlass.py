@@ -33,7 +33,7 @@ class CutlassNvFp4LinearKernel(NvFp4LinearKernel):
         # The SM120 GEMM can add the bias in its epilogue.
         self.bias_epilogue = current_platform.is_device_capability_family(120)
 
-    def input_quant_key(self) -> QuantKey:
+    def native_input_quant_key(self) -> QuantKey:
         return kNvfp4Dynamic
 
     @classmethod

@@ -201,6 +201,12 @@ def flashinfer_batch_invariant_quantizer_fits(
     )
 
 
+def flashinfer_nvfp4_4over6_requested() -> bool:
+    """Return whether FlashInfer's `nvfp4_quantize` applies the 4-over-6 recipe
+    by default (its FLASHINFER_NVFP4_4OVER6 environment flag)."""
+    return os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1"
+
+
 @functools.cache
 def has_flashinfer_concat_mla_kv_quant_fp8() -> bool:
     """Return whether FlashInfer exposes the MLA K/V pack + fp8 cast API."""
@@ -1169,10 +1175,24 @@ if has_flashinfer():
         "flashinfer_mm_bf16_fp4", _flashinfer_mm_bf16_fp4
     )
 
+    @functools.cache
+    def _flashinfer_attr(name: str) -> Any:
+        """A FlashInfer top-level attribute, resolved once (the quantizer ops run
+        per layer, so they avoid a per-call import)."""
+        import flashinfer
+
+        return getattr(flashinfer, name)
+
     def _flashinfer_mxfp4_quantize(
         a: torch.Tensor,
         backend: str,
+        batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if batch_invariant:
+            # The batch-invariant quantizer requires backend="auto".
+            return _flashinfer_attr("mxfp4_quantize")(
+                a, backend="auto", batch_invariant=True
+            )
         from flashinfer import mxfp4_quantize as _mxfp4_quantize
 
         return _mxfp4_quantize(a, backend=backend)
@@ -1180,6 +1200,7 @@ if has_flashinfer():
     def flashinfer_mxfp4_quantize_fake(
         a: torch.Tensor,
         backend: str,
+        batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = a.shape
         sf_vec_size = 32
@@ -1262,6 +1283,47 @@ if has_flashinfer():
     )
     flashinfer_nvfp4_quantize = eager_bypass_custom_op(
         "flashinfer_nvfp4_quantize", _flashinfer_nvfp4_quantize
+    )
+
+    def _flashinfer_nvfp4_quantize_128x4(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FlashInfer's batch-invariant NVFP4 quantizer in the 128x4 scale
+        layout the CUTLASS GEMM consumes. FlashInfer returns the scales as a
+        zero-padded uint8 (round_up(M, 128), round_up(K / 16, 4)) view; the
+        GEMM reads the same bytes as float8_e4m3fn."""
+        data, scale = _flashinfer_attr("nvfp4_quantize")(
+            a,
+            a_global_sf,
+            sfLayout=_flashinfer_attr("SfLayout").layout_128x4,
+            do_shuffle=False,
+            sf_vec_size=16,
+            backend="auto",
+            batch_invariant=True,
+        )
+        return data, scale.view(torch.float8_e4m3fn)
+
+    def flashinfer_nvfp4_quantize_128x4_fake(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        m, k = a.shape
+        return (
+            torch.empty(m, k // 2, dtype=torch.uint8, device=a.device),
+            torch.empty(
+                cdiv(m, 128) * 128,
+                cdiv(k // 16, 4) * 4,
+                dtype=torch.float8_e4m3fn,
+                device=a.device,
+            ),
+        )
+
+    direct_register_custom_op(
+        op_name="flashinfer_nvfp4_quantize_128x4",
+        op_func=_flashinfer_nvfp4_quantize_128x4,
+        fake_impl=flashinfer_nvfp4_quantize_128x4_fake,
+    )
+    flashinfer_nvfp4_quantize_128x4 = eager_bypass_custom_op(
+        "flashinfer_nvfp4_quantize_128x4", _flashinfer_nvfp4_quantize_128x4
     )
 
     def _flashinfer_mxfp8_quantize_8x4(
@@ -1528,6 +1590,7 @@ __all__ = [
     "has_flashinfer_bf16_gemm",
     "has_flashinfer_batch_invariant_quantizers",
     "flashinfer_batch_invariant_quantizer_fits",
+    "flashinfer_nvfp4_4over6_requested",
     "has_flashinfer_concat_mla_kv_quant_fp8",
     "is_flashinfer_bf16_gemm_supported",
     "is_flashinfer_cutedsl_bf16_gemm_supported",
